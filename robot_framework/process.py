@@ -58,20 +58,25 @@ def process(
     _set_ref_status(orchestrator_connection, client, kontakt_case_id, kontakt_ref_id, "fetching")
 
     try:
-        sags_title, documents, warnings = _fetch_go(orchestrator_connection, client, source_case_id)
+        sags_title, sags_dato, documents, warnings = _fetch_go(
+            orchestrator_connection, client, source_case_id)
     except Exception as exc:
         orchestrator_connection.log_info(f"GO document fetch failed: {exc!r}")
         _set_ref_status(orchestrator_connection, client, kontakt_case_id, kontakt_ref_id, "error", str(exc))
         raise
 
     orchestrator_connection.log_info(
-        f"Fetched {len(documents)} documents from GO ({len(warnings)} warnings) — posting to KontAKT."
+        f"Fetched {len(documents)} documents from GO ({len(warnings)} warnings), "
+        f"sagsdato={sags_dato} — posting to KontAKT."
     )
 
     import_payload = {
         "source_system": "go",
         "source_case_id": source_case_id,
         "source_case_title": sags_title,
+        # The sag's own date in GO — KontAKT shows it in the applicant's
+        # sagsoversigt, the way the old AktBob robot did.
+        "source_case_date": sags_dato,
         "documents": documents,
         "warnings": warnings,
     }
@@ -126,17 +131,29 @@ def _coerce_doc_date(raw) -> str | None:
     return None
 
 
+def _coerce_case_date(raw) -> str | None:
+    """The sag's own date as ISO ``YYYY-MM-DD``, or None.
+
+    GO gives ``ows_Modtaget`` as "YYYY-MM-DD HH:MM:SS" and Nova gives an ISO
+    timestamp, so drop anything after the day before parsing.
+    """
+    if not raw:
+        return None
+    head = str(raw).strip().replace("T", " ").split(" ")[0]
+    return _coerce_doc_date(head)
+
+
 # ----- GO document fetch -----------------------------------------------------
 
 
 def _fetch_go(
     orchestrator_connection: OrchestratorConnection, client, sags_id: str
-) -> tuple[str, list[dict], list[str]]:
-    """Return (case_title, documents, warnings) for a GO case.
+) -> tuple[str, str | None, list[dict], list[str]]:
+    """Return (case_title, case_date, documents, warnings) for a GO case.
 
     Multi-call sequence (KontAKT-specific orchestration over GO's case-list
     API; not in the lib):
-      1. ``/Cases/Metadata/{id}``       — sagstitel + SagsURL
+      1. ``/Cases/Metadata/{id}``       — sagstitel + sagsdato + SagsURL
       2. ``/Administration/GetLeftMenuCounter`` — discover views
          (UdenMapper.aspx OR IkkeJournaliseret + Journaliseret)
       3. For each view, paginate ``RenderListDataAsStream`` to collect rows
@@ -163,6 +180,9 @@ def _fetch_go(
     sags_title = xdoc.attrib.get("ows_Title") or sags_id
     sags_title = _TITLE_BAD_CHARS.sub("", str(sags_title))
     sags_title = " ".join(sags_title.split())
+    # The sag's own date. ows_Modtaget is "YYYY-MM-DD HH:MM:SS" — same field the
+    # AktBob sagsoversigt robot read.
+    sags_dato = _coerce_case_date(xdoc.attrib.get("ows_Modtaget"))
 
     if "cases/" not in sags_url:
         raise RuntimeError(f"GO-sag {sags_id} mangler 'cases/' i SagsURL")
@@ -273,7 +293,7 @@ def _fetch_go(
     if has_nul_doc:
         warnings.append("Sagen indeholder nul-dokumenter (AktID = 0).")
 
-    return sags_title, documents, warnings
+    return sags_title, sags_dato, documents, warnings
 
 
 def _scrape_view_id(session: requests.Session, go_url: str, link_url: str) -> str | None:
