@@ -1,20 +1,74 @@
+"""KontAKT: hent én F2-sags dokumentliste og læg den i KontAKT.
+
+Queue-driven, ét køelement pr. sag på en aktindsigt. Robotten slår sagen op i
+F2, læser dens struktur og sender dokumentlisten til KontAKTs import-endpoint.
+
+HVOR MEGET DEN HER FIL BLEV MINDRE, OG HVORFOR
+    GO-udgaven var 340 linjer. Den skulle hente sagens metadata, gætte sig frem
+    til hvilke SharePoint-VISNINGER der fandtes (``UdenMapper.aspx``, ellers
+    ``IkkeJournaliseret`` + ``Journaliseret``), skrabe et view-id ud af en
+    HTML-side når API'et svarede null, paginere ``RenderListDataAsStream`` og
+    slå bilagsrelationer op pr. dokument.
+
+    F2 kan svare på det samme med ét kald: ``rel/structure`` giver hele sagen -
+    akter med deres felter og dokumenter med Id, Titel, filtype og størrelse.
+    Resten af filen er derfor kortlægning: F2's begreber over i KontAKTs.
+
+    Den ene ting, der koster mere end ét kald: strukturens akter har IKKE
+    ``Type`` (Inbound/Outbound/Internal), og det er den kolonne, aktlisten
+    kalder "Kategori". Den står kun på aktens fulde repræsentation, og
+    ``/cases/<id>/matters`` giver MINDRE end strukturen (kun Id og Titel), så
+    der er ét GET pr. akt. Målt til ~175 ms, så en sag med 50 akter koster ni
+    sekunder - det er en robot, og det er fint.
+
+F2'S MODEL OVER I KONTAKTS
+    En AKT er et stykke korrespondance - et brev, en mail, en note. Den har
+    ét hoveddokument (aktens egen tekst) og et vilkårligt antal bilag.
+
+        akt_id            <- aktens CaseMatterNumber
+        dok_id            <- dokumentets Id
+        doc_category      <- aktens Type
+        doc_date          <- aktens LetterDate (ellers modtaget/sendt/oprettet)
+        bilag_til_dok_id  <- hoveddokumentets Id, for hvert bilag
+        link_to_doc       <- dokumentets alternate (f2t://document/<id>)
+
+    ``CaseMatterNumber`` fås FØRST når akten er arkiveret. Målt på 42 akter:
+    hver arkiveret akt har et nummer, ingen uarkiveret har et. En kladde i F2
+    har altså heller ikke et aktnummer for et menneske, så ``akt_id`` er tom -
+    og det er den rigtige oversættelse, ikke et hul.
+
+    Hoveddokumentet står IKKE i strukturens dokumentliste. Det er kun nåeligt
+    gennem aktens egen ``rel/pdf-content``, som peger på det. Så det hentes
+    derfra og lægges først, og bilagene peger på det.
+
+OO config:
+    Constant   F2Miljoe        "test" eller "prod"
+    Constant   F2RestTestURL   F2's vaert, uden https://
+    Constant   F2RestProdURL   ditto
+    Credential F2TESTRestAkt   F2REST-klientens id + hemmelighed
+    Credential F2PRODRestAkt   ditto
+    Credential KontAKTAPI      username = base URL, password = X-API-Key
+"""
 from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
 from OpenOrchestrator.database.queues import QueueElement
 import json
 import re
-import xml.etree.ElementTree as ET
-from datetime import datetime
-from urllib.parse import quote
 
 import requests
 
 from robot_framework import reset
 from robot_framework.exceptions import CaseDeleted
-from oomtm import go as oomtm_go
+from oomtm import f2 as oomtm_f2
 
+# Tegn, KontAKT ikke skal have i en dokumenttitel. Bevaret fra GO-udgaven: de
+# gav problemer i filnavne og i regneark, og en titel fra et ESDH kan indeholde
+# hvad som helst.
+_TITEL_BAD = re.compile(r'[~#%&*{}\:\\<>?/+|\"\'\t\[\]`^@=!$();\€£¥₹]')
 
-# ----- Document title sanitization (preserved from legacy robot) -------------
-_TITLE_BAD_CHARS = re.compile(r'[~#%&*{}\:\\<>?/+|\"\'\t\[\]`^@=!$();\€£¥₹]')
+# F2's akttyper over i den tekst, aktlisten viser i "Kategori"-kolonnen. Samme
+# ord som GO brugte i sit Korrespondance-felt, så aktlisten ser ud som før.
+KATEGORI = {"Inbound": "Indgående", "Outbound": "Udgående",
+            "Internal": "Internt"}
 
 
 # ----- Deleted in KontAKT ----------------------------------------------------
@@ -52,43 +106,44 @@ def process(
     source_case_id = str(payload["source_case_id"]).strip()
 
     orchestrator_connection.log_info(
-        f"KontAKT case={kontakt_case_id} ref={kontakt_ref_id} GO case={source_case_id}"
+        f"KontAKT case={kontakt_case_id} ref={kontakt_ref_id} F2 case={source_case_id}"
     )
 
-    _set_ref_status(orchestrator_connection, client, kontakt_case_id, kontakt_ref_id, "fetching")
+    _set_ref_status(orchestrator_connection, client, kontakt_case_id,
+                    kontakt_ref_id, "fetching")
 
     try:
-        sags_title, sags_dato, documents, warnings = _fetch_go(
+        titel, dato, dokumenter, advarsler = _hent_f2(
             orchestrator_connection, client, source_case_id)
     except Exception as exc:
-        orchestrator_connection.log_info(f"GO document fetch failed: {exc!r}")
-        _set_ref_status(orchestrator_connection, client, kontakt_case_id, kontakt_ref_id, "error", str(exc))
+        orchestrator_connection.log_info(f"F2 document fetch failed: {exc!r}")
+        _set_ref_status(orchestrator_connection, client, kontakt_case_id,
+                        kontakt_ref_id, "error", str(exc))
         raise
 
     orchestrator_connection.log_info(
-        f"Fetched {len(documents)} documents from GO ({len(warnings)} warnings), "
-        f"sagsdato={sags_dato} — posting to KontAKT."
+        f"Fetched {len(dokumenter)} documents from F2 ({len(advarsler)} warnings), "
+        f"sagsdato={dato} — posting to KontAKT."
     )
 
-    import_payload = {
-        "source_system": "go",
-        "source_case_id": source_case_id,
-        "source_case_title": sags_title,
-        # The sag's own date in GO — KontAKT shows it in the applicant's
-        # sagsoversigt, the way the old AktBob robot did.
-        "source_case_date": sags_dato,
-        "documents": documents,
-        "warnings": warnings,
-    }
     r = _kontakt_post(
         client,
         f"/api/v1/cases/{kontakt_case_id}/documents/import",
-        import_payload,
+        {
+            "source_system": "f2",
+            "source_case_id": source_case_id,
+            "source_case_title": titel,
+            # Sagens egen dato - KontAKT viser den i ansøgerens sagsoversigt.
+            "source_case_date": dato,
+            "documents": dokumenter,
+            "warnings": advarsler,
+        },
         timeout=120,
     )
     if r.status_code not in (200, 201):
         msg = f"KontAKT import failed: HTTP {r.status_code} body={r.text[:400]!r}"
-        _set_ref_status(orchestrator_connection, client, kontakt_case_id, kontakt_ref_id, "error", msg)
+        _set_ref_status(orchestrator_connection, client, kontakt_case_id,
+                        kontakt_ref_id, "error", msg)
         raise RuntimeError(msg)
 
     # The import endpoint already sets ref.status = 'docs_loaded' when
@@ -96,217 +151,160 @@ def process(
     orchestrator_connection.log_info(f"Done. Response: {r.json()}")
 
 
-# ----- Helpers ---------------------------------------------------------------
+# ----- F2 document fetch -----------------------------------------------------
 
 
-def _shorten_title(title: str) -> str:
-    """Trim long titles. Matches legacy ``shorten_document_title``."""
-    if title and len(title) > 99:
-        return title[:95]
-    return title
+def _hent_f2(oc, client, sagsnummer: str):
+    """(sagstitel, sagsdato, dokumenter, advarsler) for én F2-sag.
 
+    ``case_by_number`` går IKKE gennem søgeindekset, så en sag, der blev
+    oprettet for et minut siden, kan findes. Det er vigtigt her: en
+    sagsbehandler, der lige har fået sagsnummeret, søger aktindsigt i den med
+    det samme.
+    """
+    f2 = client.f2
+    sag = f2.case_by_number(sagsnummer)
+    if sag is None:
+        # 403 og 404 kan ikke skelnes i F2 - et adgangsstyret system afslører
+        # ikke, at noget FINDES, som man ikke må se. Så beskeden må dække begge.
+        raise RuntimeError(
+            f"Sagen {sagsnummer!r} kan ikke hentes fra F2. Den findes ikke, "
+            f"eller API-brugeren har ikke adgang til nogen af dens akter.")
 
-def _looks_like_redacted(title: str) -> bool:
-    """memo / tunnel / fletteliste detection — these auto-mark Nej."""
-    t = (title or "").lower()
-    return ("tunnel_marking" in t) or ("memometadata" in t) or ("fletteliste" in t)
+    titel = _ren_titel(oomtm_f2.text(sag, "Title")) or sagsnummer
+    sags_dato = _dato(oomtm_f2.text(sag, "CreatedDate"))
 
+    dokumenter: list[dict] = []
+    advarsler: list[str] = []
+    mangler_dato = False
+    uden_aktnummer = 0
 
-def _coerce_doc_date(raw) -> str | None:
-    """Try several date formats; return ISO YYYY-MM-DD or None."""
-    if not raw:
-        return None
-    s = str(raw).strip()
-    if not s or s.lower() in {"none", "null"}:
-        return None
-    if "T" in s:
-        s = s.split("T", 1)[0]
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%dT%H:%M:%S"):
+    akter = oomtm_f2.matters(f2.structure(sag))
+    oc.log_info(f"{sagsnummer}: {len(akter)} akter i F2.")
+    for kort in akter:
         try:
-            return datetime.strptime(
-                s if fmt != "%Y-%m-%dT%H:%M:%S" else str(raw), fmt
-            ).date().isoformat()
-        except ValueError:
+            akt = f2.get(oomtm_f2.links(kort)["self"])
+        except oomtm_f2.F2Error as exc:
+            # Én utilgængelig akt må ikke koste hele sagen: sagsbehandleren skal
+            # kunne se de dokumenter, der ER adgang til, og få det at vide.
+            oc.log_info(f"akt {oomtm_f2.text(kort, 'Id')} kunne ikke hentes: "
+                        f"{exc.status}")
+            advarsler.append(
+                f"Akt {oomtm_f2.text(kort, 'Title') or oomtm_f2.text(kort, 'Id')} "
+                f"kunne ikke hentes fra F2 (adgang eller sletning).")
             continue
+
+        akt_nr = f2.matter_number(akt)
+        if akt_nr is None:
+            uden_aktnummer += 1
+        kategori = KATEGORI.get(oomtm_f2.text(akt, "Type"), "")
+        akt_dato = _akt_dato(akt)
+        if not akt_dato:
+            mangler_dato = True
+
+        # Hoveddokumentet først: aktens egen tekst. Den står ikke i strukturens
+        # dokumentliste, kun bag aktens rel/pdf-content.
+        hoved_id = _hoveddokument_id(akt)
+        if hoved_id:
+            dokumenter.append(_raekke(
+                dok_id=hoved_id, akt_id=akt_nr,
+                titel=_ren_titel(oomtm_f2.text(akt, "Title")) or f"Akt {akt_nr or ''}".strip(),
+                kategori=kategori, dato=akt_dato, bilag_til=None))
+
+        for dok in oomtm_f2.documents(kort):
+            dok_id = oomtm_f2.text(dok, "Id")
+            if not dok_id or dok_id == hoved_id:
+                continue
+            dokumenter.append(_raekke(
+                dok_id=dok_id, akt_id=akt_nr,
+                titel=_ren_titel(oomtm_f2.text(dok, "Title")) or dok_id,
+                kategori=kategori, dato=akt_dato,
+                # Bilag hænger på aktens hoveddokument. Er der intet
+                # hoveddokument, er der ikke noget at hænge dem på, og så står
+                # de for sig - hellere det end en henvisning, der peger i luften.
+                bilag_til=hoved_id or None))
+
+    if mangler_dato:
+        advarsler.append("En eller flere akter mangler dato i F2.")
+    if uden_aktnummer:
+        advarsler.append(
+            f"{uden_aktnummer} akt(er) er ikke arkiveret i F2 og har derfor "
+            f"intet aktnummer endnu.")
+    if not dokumenter:
+        advarsler.append("Sagen har ingen dokumenter, API-brugeren kan se.")
+    return titel, sags_dato, dokumenter, advarsler
+
+
+def _raekke(*, dok_id, akt_id, titel, kategori, dato, bilag_til) -> dict:
+    """Én række, som KontAKTs import-endpoint vil have den.
+
+    ``grant_access`` sættes IKKE. GO-udgaven gættede "Nej" på titler, der lignede
+    overstregningsfiler (``tunnel_marking``, ``memometadata``, ``fletteliste``) -
+    det var SharePoint-artefakter fra den gamle løsning, og de findes ikke i F2.
+    Beslutningen om aktindsigt er sagsbehandlerens, og et gæt, der ser ud som en
+    beslutning, er værre end et tomt felt.
+    """
+    return {
+        "dok_id": str(dok_id),
+        "akt_id": akt_id,
+        "title": _kort_titel(titel),
+        "doc_category": kategori or None,
+        "doc_date": dato,
+        "bilag_til_dok_id": bilag_til,
+        "bilag_index": None,
+        "link_to_doc": f"f2t://document/{dok_id}",
+        "included_in_request": "Ja",
+        "grant_access": None,
+        "justification": None,
+    }
+
+
+def _hoveddokument_id(akt) -> str:
+    """Aktens eget dokument - brevet, notatet, mailteksten.
+
+    F2 oplyser det ikke som et felt. Aktens ``rel/pdf-content`` peger på det
+    (``…/documents/253530/pdf-content``), og det er den eneste vej dertil vi har
+    fundet. Målt på tre akter, hvor hver pegede på sit eget.
+    """
+    url = oomtm_f2.links(akt).get(oomtm_f2.REL + "pdf-content", "")
+    if "/documents/" not in url:
+        return ""
+    rest = url.split("/documents/", 1)[1]
+    kandidat = rest.split("/", 1)[0].split("?", 1)[0]
+    return kandidat if kandidat.isdigit() else ""
+
+
+def _akt_dato(akt) -> str | None:
+    """Aktens dato, i den rækkefølge et menneske ville vælge den.
+
+    ``LetterDate`` er brevdatoen og står på både ind- og udgående; den er den
+    rigtige på aktlisten. Falder tilbage på modtaget/sendt og til sidst på, hvornår
+    akten blev oprettet - så kolonnen er tom så sjældent som muligt.
+    """
+    for felt in ("LetterDate", "ReceivedDate", "SentDate", "CreatedDate"):
+        d = _dato(oomtm_f2.text(akt, felt))
+        if d:
+            return d
     return None
 
 
-def _coerce_case_date(raw) -> str | None:
-    """The sag's own date as ISO ``YYYY-MM-DD``, or None.
-
-    GO gives ``ows_Modtaget`` as "YYYY-MM-DD HH:MM:SS" and Nova gives an ISO
-    timestamp, so drop anything after the day before parsing.
-    """
-    if not raw:
-        return None
-    head = str(raw).strip().replace("T", " ").split(" ")[0]
-    return _coerce_doc_date(head)
+def _dato(raw) -> str | None:
+    """F2's "2026-09-07T15:24:55.773" -> "2026-09-07"."""
+    s = str(raw or "").strip()
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    return None
 
 
-# ----- GO document fetch -----------------------------------------------------
+def _ren_titel(titel: str) -> str:
+    return " ".join(_TITEL_BAD.sub("", str(titel or "")).split())
 
 
-def _fetch_go(
-    orchestrator_connection: OrchestratorConnection, client, sags_id: str
-) -> tuple[str, str | None, list[dict], list[str]]:
-    """Return (case_title, case_date, documents, warnings) for a GO case.
-
-    Multi-call sequence (KontAKT-specific orchestration over GO's case-list
-    API; not in the lib):
-      1. ``/Cases/Metadata/{id}``       — sagstitel + sagsdato + SagsURL
-      2. ``/Administration/GetLeftMenuCounter`` — discover views
-         (UdenMapper.aspx OR IkkeJournaliseret + Journaliseret)
-      3. For each view, paginate ``RenderListDataAsStream`` to collect rows
-      4. For each row, look up Parents via ``oomtm.go`` to discover bilag.
-    """
-    session = client.go_session
-    go_url = client.go_url
-
-    # --- 1. Case metadata ---
-    meta_url = f"{go_url}/_goapi/Cases/Metadata/{sags_id}"
-    try:
-        r = session.get(meta_url, timeout=500)
-        r.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Kan ikke hente sagstitel på {sags_id}: {exc}") from exc
-
-    meta = r.json()
-    metadata_xml = meta.get("Metadata")
-    if not metadata_xml:
-        raise RuntimeError(f"Metadata mangler i GO-svar for {sags_id}")
-
-    xdoc = ET.fromstring(metadata_xml)
-    sags_url = xdoc.attrib.get("ows_CaseUrl") or ""
-    sags_title = xdoc.attrib.get("ows_Title") or sags_id
-    sags_title = _TITLE_BAD_CHARS.sub("", str(sags_title))
-    sags_title = " ".join(sags_title.split())
-    # The sag's own date. ows_Modtaget is "YYYY-MM-DD HH:MM:SS" — same field the
-    # AktBob sagsoversigt robot read.
-    sags_dato = _coerce_case_date(xdoc.attrib.get("ows_Modtaget"))
-
-    if "cases/" not in sags_url:
-        raise RuntimeError(f"GO-sag {sags_id} mangler 'cases/' i SagsURL")
-    akt = sags_url.split("cases/")[1].split("/")[0]
-    encoded_sags_id = sags_id.replace("-", "%2D")
-    list_url = f"%27%2Fcases%2F{akt}%2F{encoded_sags_id}%2FDokumenter%27"
-
-    # --- 2. Discover views ---
-    menu_resp = session.get(
-        f"{go_url}/{sags_url}/_goapi/Administration/GetLeftMenuCounter", timeout=500
-    )
-    menu_resp.raise_for_status()
-    views_array = menu_resp.json()
-
-    view_id = None
-    ikke_journaliseret_id = None
-    journaliseret_id = None
-    for item in views_array:
-        name = (item.get("ViewName") or "").strip()
-        if name == "UdenMapper.aspx":
-            view_id = item["ViewId"]
-            break
-        elif name.lower() == "ikkejournaliseret.aspx":
-            ikke_journaliseret_id = item.get("ViewId")
-            if ikke_journaliseret_id is None and item.get("LinkUrl"):
-                ikke_journaliseret_id = _scrape_view_id(session, go_url, item["LinkUrl"])
-        elif name == "Journaliseret.aspx":
-            journaliseret_id = item.get("ViewId")
-            if journaliseret_id is None and item.get("LinkUrl"):
-                journaliseret_id = _scrape_view_id(session, go_url, item["LinkUrl"])
-
-    view_ids_to_use = [view_id] if view_id else [v for v in (ikke_journaliseret_id, journaliseret_id) if v]
-    if not view_ids_to_use:
-        raise RuntimeError(f"Ingen brugbar visning fundet for {sags_id}")
-
-    documents: list[dict] = []
-    warnings: list[str] = []
-    has_missing_date = False
-    has_nul_doc = False
-
-    # --- 3 + 4. Paginate rows, expand bilag relationships ---
-    for current_view_id in view_ids_to_use:
-        first_run = True
-        next_href = None
-        more_pages = True
-        while more_pages:
-            if first_run:
-                url = (
-                    f"{go_url}/{sags_url}/_api/web/GetList(@listUrl)/RenderListDataAsStream"
-                    f"?@listUrl={list_url}&View={current_view_id}"
-                )
-            else:
-                url = (
-                    f"{go_url}/{sags_url}/_api/web/GetList(@listUrl)/RenderListDataAsStream"
-                    f"?@listUrl={list_url}{(next_href or '').replace('?', '&')}"
-                )
-            resp = session.post(url, timeout=500)
-            resp.raise_for_status()
-            payload = resp.json()
-            rows = payload.get("Row", []) or []
-            next_href = payload.get("NextHref")
-            more_pages = bool(next_href)
-
-            for item in rows:
-                dokument_url = go_url.replace("ad.", "") + quote(item.get("FileRef", ""), safe="/")
-                akt_id_raw = (item.get("CaseRecordNumber") or "").replace(".", "")
-                try:
-                    akt_id = int(akt_id_raw) if akt_id_raw else None
-                except ValueError:
-                    akt_id = None
-                if akt_id_raw and akt_id_raw.strip() == "0":
-                    has_nul_doc = True
-
-                dokument_dato = _coerce_doc_date(item.get("Dato"))
-                if not dokument_dato:
-                    has_missing_date = True
-
-                title = item.get("Title") or ""
-                if len(title) < 2:
-                    title = item.get("FileLeafRef.Name", "") or title
-                dok_id = str(item.get("DocID") or "").strip()
-                kategori = item.get("Korrespondance")
-
-                # Bilag relationships via oomtm.go
-                bilag_til = ""
-                if dok_id:
-                    parents = oomtm_go.fetch_parents(session, base_url=go_url, dok_id=dok_id)
-                    bilag_til = ", ".join(p for p in parents if p)
-
-                redacted = _looks_like_redacted(title)
-                documents.append({
-                    "dok_id": dok_id,
-                    "akt_id": akt_id,
-                    "title": _shorten_title(title),
-                    "doc_category": kategori,
-                    "doc_date": dokument_dato,
-                    "bilag_til_dok_id": bilag_til or None,
-                    "bilag_index": None,
-                    "link_to_doc": dokument_url,
-                    "included_in_request": "Ja",
-                    "grant_access": "Nej" if redacted else None,
-                    "justification": "Tavshedsbelagte oplysninger - om private forhold" if redacted else None,
-                })
-            first_run = False
-
-    if has_missing_date:
-        warnings.append("Et eller flere dokumenter mangler dato i GO.")
-    if has_nul_doc:
-        warnings.append("Sagen indeholder nul-dokumenter (AktID = 0).")
-
-    return sags_title, sags_dato, documents, warnings
-
-
-def _scrape_view_id(session: requests.Session, go_url: str, link_url: str) -> str | None:
-    """Fallback when GetLeftMenuCounter returns a null ViewId — scrape it from the page."""
-    try:
-        r = session.get(f"{go_url}{link_url}")
-        m = re.search(r"_spPageContextInfo\s*=\s*({.*?});", r.text, re.DOTALL)
-        if not m:
-            return None
-        ctx = json.loads(m.group(1))
-        return (ctx.get("viewId") or "").strip("{}") or None
-    except Exception:  # pylint: disable=broad-except
-        return None
+def _kort_titel(titel: str) -> str:
+    """Klip lange titler. Samme grænse som GO-udgaven, fordi det er KontAKTs
+    kolonne, der sætter den - ikke kildesystemets."""
+    t = str(titel or "")
+    return t[:95] if len(t) > 99 else t
 
 
 # ----- KontAKT API client ----------------------------------------------------
@@ -323,7 +321,8 @@ def _kontakt_post(client, path: str, payload: dict, *, timeout: int = 60) -> req
     return resp
 
 
-def _set_ref_status(orchestrator_connection, client, case_id: int, ref_id: int | None, status: str, message: str = "") -> None:
+def _set_ref_status(orchestrator_connection, client, case_id: int, ref_id: int | None,
+                    status: str, message: str = "") -> None:
     if not ref_id:
         return
     try:

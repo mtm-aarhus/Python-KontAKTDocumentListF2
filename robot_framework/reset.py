@@ -1,26 +1,30 @@
 """This module handles resetting the state of the computer so the robot can work with a clean slate.
 
-For this robot the "state" is the GO session and the cached OO credentials.
-``open_all`` opens them and returns a :class:`Client`; ``reset`` re-opens them,
-so the queue framework can reconnect on a retry instead of building a new GO
-session for every queue element.
+For this robot the "state" is the F2 connection and the cached KontAKT
+credentials. ``open_all`` opens them and returns a :class:`Client`; ``reset``
+re-opens them, so the queue framework can reconnect on a retry instead of
+logging in to F2 for every single queue element.
 """
 
 from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
 
-from oomtm import go as oomtm_go
+from oomtm import f2 as oomtm_f2
 
 
 class Client:
-    """Live GO session + cached KontAKT credentials, opened by ``open_all`` and
-    reused across every queue element (multiple cases share one GO session)."""
+    """Live F2 connection + cached KontAKT credentials.
+
+    Opened by ``open_all`` and reused across every queue element: F2-klienten
+    holder sit bearer-token og sit service index, saa tyve sager i samme koersel
+    logger ind én gang.
+    """
 
     def __init__(self, orchestrator_connection: OrchestratorConnection):
-        go_cred = orchestrator_connection.get_credential("GOAktApiUser")
-        self.go_url = orchestrator_connection.get_constant("GOApiURL").value
-        self.go_user = go_cred.username
-        self.go_pass = go_cred.password
-        self.go_session = oomtm_go.session(go_cred.username, go_cred.password)
+        # Hele F2-opsaetningen er ét sted, og et skifte til produktion er én
+        # constant (F2Miljoe). Se oomtm.f2.Config.from_orchestrator.
+        self.f2 = oomtm_f2.F2(
+            oomtm_f2.Config.from_orchestrator(orchestrator_connection),
+            log=orchestrator_connection.log_info)
         kontakt = orchestrator_connection.get_credential("KontAKTAPI")
         self.kontakt_base = kontakt.username
         self.kontakt_key = kontakt.password
@@ -55,5 +59,5 @@ def kill_all(orchestrator_connection: OrchestratorConnection) -> None:
 
 def open_all(orchestrator_connection: OrchestratorConnection) -> Client:
     """Open all connections used by the robot and return them as a :class:`Client`."""
-    orchestrator_connection.log_trace("Opening GO connection.")
+    orchestrator_connection.log_trace("Opening F2 connection.")
     return Client(orchestrator_connection)

@@ -33,7 +33,7 @@ def make_queue_element_with_payload(
 
 # pylint: disable-next=unused-argum
 orchestrator_connection = OrchestratorConnection(
-    "KontAKTDocumentListGO",
+    "KontAKTDocumentListF2",
     os.getenv("OpenOrchestratorSQL"),
     os.getenv("OpenOrchestratorKey"),
     None,
@@ -67,10 +67,10 @@ else:
         payload={
             "kontakt_case_id": 11,
             "kontakt_reference_id": 12,
-            "source_case_id": "GEO-2024-000170",
-            "source_case_title": "Test geosag [dato]"
+            "source_case_id": "2026 - 559",
+            "source_case_title": "Testsag fra F2 [dato]"
         },
-        queue_name="KontAKTDocumentListGO",
+        queue_name="KontAKTDocumentListF2",
         reference="Sandbox",
         status=QueueStatus.NEW,
     )
