@@ -95,7 +95,7 @@ beskeden dækker begge.
 | | |
 |---|---|
 | Constant `F2Miljoe` | `test` eller `prod` |
-| Constant `F2RestTestURL` / `F2RestProdURL` | F2's vært, uden `https://` |
+| Constant `F2RestTestURL` / `F2RestProdURL` | F2's vært. `https://` må gerne stå der - klienten sætter det kun på, hvis det mangler |
 | Credential `F2TESTRestAkt` / `F2PRODRestAkt` | F2REST-klientens id + hemmelighed |
 | Credential `KontAKTAPI` | username = base URL, password = X-API-Key |
 

@@ -43,7 +43,7 @@ F2'S MODEL OVER I KONTAKTS
 
 OO config:
     Constant   F2Miljoe        "test" eller "prod"
-    Constant   F2RestTestURL   F2's vaert, uden https://
+    Constant   F2RestTestURL   F2's vaert (med eller uden https://)
     Constant   F2RestProdURL   ditto
     Credential F2TESTRestAkt   F2REST-klientens id + hemmelighed
     Credential F2PRODRestAkt   ditto
