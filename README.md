@@ -115,8 +115,16 @@ Mappen er omdøbt, og **`QUEUE_NAME` er skiftet fra `KontAKTDocumentListGO` til
 
 ## Uafklaret
 
-**API-brugeren kan kun finde sager, den selv står på.** Adgang til at *finde* en
-sag = adgang til mindst én af dens akter, og robotten er ikke part på Teknik og
-Miljøs sager. Det er den vigtigste af de rettigheder, der er spurgt cBrain om -
-se `F2-SPOERGSMAAL-TIL-CBRAIN.md`, del 1, punkt 1. Indtil den er på plads kan
-robotten kun hente dokumentlister for de sager, den har adgang til.
+**Kan robotten læse enhver sag i Teknik og Miljø?** Delvist afklaret 2026-09-10:
+API-brugeren KAN fremsøge og læse sager, den intet har med at gøre - 27 fremmede
+sager fundet, og dokumenternes bytes hentet fra fire af dem. Hele læsevejen
+virker altså på dem.
+
+Men de sager ser ud til at være uden adgangsbegrænsning, og der er ingen rigtige
+Byggeri-sager i testmiljøet at prøve på (`byggeri`, `tilladelse`, `ejendom`,
+`vej` giver alle 0 træf). Om en ADGANGSBEGRÆNSET sag kan læses, er uprøvet - og
+det er det, der er spurgt cBrain om. Se `MDFiles/F2-SPOERGSMAAL-TIL-CBRAIN.md`.
+
+En tidligere udgave af det her afsnit påstod, at API-brugeren kun kunne finde
+sager, den selv stod på. Det var en slutning fra en måling på et MENNESKES
+adgang, ikke en måling på API-brugeren, og den var forkert.
